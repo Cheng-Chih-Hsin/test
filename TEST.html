@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>雲端同步照片分類器 (圖片網址)</title>
+    <!-- 載入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'primary': '#4F46E5',
+                        'secondary': '#6B7280',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6; /* 輕灰色背景 */
+        }
+        .app-container {
+            max-width: 400px; /* 模擬手機螢幕寬度 */
+            min-height: 100vh;
+            margin: 0 auto;
+            background-color: white;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            padding: 1.5rem;
+        }
+        /* 簡單的載入動畫 */
+        .loading-dot {
+            animation: bounce 1s infinite alternate;
+        }
+        .loading-dot:nth-child(2) { animation-delay: 0.3s; }
+        .loading-dot:nth-child(3) { animation-delay: 0.6s; }
+        @keyframes bounce {
+            to { transform: translateY(-5px); }
+        }
+    </style>
+</head>
+<body class="p-4 sm:p-8">
+
+    <div id="app" class="app-container rounded-3xl">
+        <!-- 內容將由 JavaScript 動態渲染 -->
+        <div id="loading-overlay" class="min-h-[50vh] flex flex-col items-center justify-center text-primary">
+            <div class="flex space-x-2">
+                <div class="loading-dot w-3 h-3 bg-primary rounded-full"></div>
+                <div class="loading-dot w-3 h-3 bg-primary rounded-full"></div>
+                <div class="loading-dot w-3 h-3 bg-primary rounded-full"></div>
+            </div>
+            <p class="mt-4 font-semibold text-sm">正在從雲端載入資料...</p>
+        </div>
+    </div>
+
+    <script type="module">
+        // 匯入 Firebase SDK
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- 核心全域變數 (由 Canvas 環境提供) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        let userId = null;
+        let docRef = null;
+        let isAuthReady = false;
+
+        // 初始人物資料 (作為資料庫的預設結構)
+        // 結構更新：files 陣列現在包含 { name: string, url: string }
+        const PEOPLE_DEFAULT = {
+            'p1': { name: '第一個人大頭照', files: [
+                { name: 'p1_1.jpg', url: 'https://placehold.co/100x100/4F46E5/ffffff?text=P1-1' },
+                { name: 'p1_2.jpg', url: 'https://placehold.co/100x100/4F46E5/ffffff?text=P1-2' },
+            ], photoCount: 2 },
+            'p2': { name: '第二個人大頭照', files: [
+                { name: 'p2_1.jpg', url: 'https://placehold.co/100x100/9333EA/ffffff?text=P2-1' },
+                { name: 'p2_2.jpg', url: 'https://placehold.co/100x100/9333EA/ffffff?text=P2-2' },
+                { name: 'p2_3.jpg', url: 'https://placehold.co/100x100/9333EA/ffffff?text=P2-3' },
+            ], photoCount: 3 },
+            'p3': { name: '第三個人大頭照', files: [
+                { name: 'p3_1.jpg', url: 'https://placehold.co/100x100/10B981/ffffff?text=P3-1' }
+            ], photoCount: 1 },
+            'unknown': { name: '未分類照片', files: [], photoCount: 0 }
+        };
+
+        // 應用程式狀態管理
+        let appState = {
+            view: 'main', 
+            selectedFiles: [], 
+            currentPersonId: null,
+            people: JSON.parse(JSON.stringify(PEOPLE_DEFAULT)), // 儲存從 Firestore 載入的資料
+            isSaving: false,
+            classificationResults: {},
+        };
+
+        // --- Firebase 初始化與驗證 ---
+
+        async function initFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("Firebase initialized. User ID:", userId);
+                        
+                        // 設定 Firestore 文件路徑: /artifacts/{appId}/users/{userId}/face_data/config
+                        docRef = doc(db, 'artifacts', appId, 'users', userId, 'face_data', 'config');
+                        
+                        isAuthReady = true;
+                        startDataListener();
+                    } else {
+                        console.error("Authentication failed or not ready.");
+                        isAuthReady = true;
+                        render();
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase 初始化錯誤:", error);
+                isAuthReady = true;
+                render(); 
+            }
+        }
+
+        // --- Firestore 數據操作 ---
+        
+        // 實時監聽數據
+        function startDataListener() {
+            if (!docRef) return;
+            
+            onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const cloudData = docSnap.data();
+                    console.log("Data loaded from cloud.", cloudData);
+                    
+                    Object.keys(appState.people).forEach(key => {
+                        if (cloudData.people[key]) {
+                            const personData = cloudData.people[key];
+                            
+                            appState.people[key] = {
+                                ...appState.people[key],
+                                ...personData,
+                                // files 陣列現在包含 { name, url } 物件
+                                files: personData.files || [],
+                                // 確保 photoCount 反映 files.length
+                                photoCount: personData.files ? personData.files.length : 0, 
+                                classifiedCount: personData.classifiedCount || 0
+                            };
+                        }
+                    });
+
+                    appState.classificationResults = cloudData.classificationResults || {};
+
+                } else {
+                    console.log("No initial data found, saving default structure.");
+                    saveData(appState.people, appState.classificationResults);
+                }
+                
+                render(); 
+            }, (error) => {
+                console.error("Firestore onSnapshot error:", error);
+                render();
+            });
+        }
+
+        // 儲存數據到雲端
+        async function saveData(peopleData, resultsData) {
+            if (!docRef) {
+                console.error("Firestore document reference is not set.");
+                return;
+            }
+            appState.isSaving = true;
+            render(); 
+
+            try {
+                // 在儲存前，重新計算 photoCount 確保一致性
+                Object.values(peopleData).forEach(p => {
+                    p.photoCount = p.files.length;
+                });
+
+                await setDoc(docRef, { 
+                    people: peopleData,
+                    classificationResults: resultsData || {}
+                });
+                console.log("Data successfully saved to Firestore.");
+            } catch (e) {
+                console.error("Error writing document: ", e);
+            } finally {
+                appState.isSaving = false;
+                render(); 
+            }
+        }
+
+        // --- Utility Functions ---
+
+        // 模擬的分類邏輯 (取代 OpenCV)
+        async function simulateClassification(files) {
+            Object.values(appState.people).forEach(p => {
+                p.classifiedCount = 0;
+            });
+            
+            const keys = ['p1', 'p2', 'p3', 'unknown'];
+            const newResults = {}; 
+
+            files.forEach(file => {
+                const randomKey = keys[Math.floor(Math.random() * keys.length)];
+                
+                appState.people[randomKey].classifiedCount = (appState.people[randomKey].classifiedCount || 0) + 1;
+                
+                if (!newResults[randomKey]) newResults[randomKey] = [];
+                newResults[randomKey].push(file.name);
+            });
+            
+            appState.classificationResults = newResults;
+            appState.selectedFiles = []; 
+            appState.view = 'results';
+            
+            await saveData(appState.people, appState.classificationResults);
+            render();
+        }
+
+        // 處理多檔案選取 (分類前的待分類檔案)
+        function handleFileSelection(event) {
+            const newFiles = Array.from(event.target.files);
+            // 待分類檔案只需名稱，無需網址
+            const mockFiles = newFiles.map(file => ({ name: file.name }));
+            appState.selectedFiles.push(...mockFiles);
+            render();
+        }
+
+        // 處理詳細頁面新增照片 (模擬雲端上傳並儲存 URL)
+        async function handleDetailFileAddition(event) {
+            const newFiles = Array.from(event.target.files);
+            const personId = appState.currentPersonId;
+            
+            if (!appState.people[personId]) return;
+
+            // 模擬檔案上傳到雲端儲存後取得的 URL
+            const mockFiles = newFiles.map((file, index) => {
+                // 使用 placehold.co 服務來視覺化雲端儲存的圖片
+                // 網址包含人物ID和圖片編號，模擬永久雲端連結
+                const fileIndex = appState.people[personId].files.length + index + 1;
+                const colorMap = {
+                    'p1': '4F46E5', // Primary
+                    'p2': '9333EA', // Purple
+                    'p3': '10B981', // Green
+                };
+                const color = colorMap[personId] || '6B7280';
+                const mockUrl = `https://placehold.co/100x100/${color}/ffffff?text=${personId.toUpperCase()}-${fileIndex}`;
+
+                return {
+                    name: file.name,
+                    url: mockUrl // 這是儲存到 Firestore 的 URL
+                };
+            });
+
+            // 更新狀態
+            appState.people[personId].files.push(...mockFiles);
+            // photoCount會在 saveData 時自動更新
+
+            // 儲存更新後的狀態到雲端
+            await saveData(appState.people, appState.classificationResults);
+            
+            render();
+        }
+
+
+        // 導航函數
+        function navigateToDetail(personId) {
+            appState.currentPersonId = personId;
+            appState.view = 'detail';
+            render();
+        }
+
+        function navigateBack() {
+            appState.view = 'main';
+            appState.currentPersonId = null;
+            render();
+        }
+
+        // --- Component Rendering Functions ---
+
+        // 渲染主頁 (Main)
+        function renderMainPage(container) {
+            const { selectedFiles, people } = appState;
+            
+            const peopleForDisplay = JSON.parse(JSON.stringify(people)); 
+            delete peopleForDisplay.unknown.files;
+
+
+            container.innerHTML = `
+                <h1 class="text-2xl font-bold text-gray-800 mb-6">照片分類主頁</h1>
+                <p class="text-sm text-gray-500 mb-6">點擊人物頭像進入詳細頁面，或選擇照片進行分類。</p>
+                
+                <!-- 大頭照列表 -->
+                <div class="space-y-4 mb-8">
+                    <div id="person-p1" class="person-card"></div>
+                    <div id="person-p2" class="person-card"></div>
+                    <div id="person-p3" class="person-card"></div>
+                </div>
+
+                <!-- 選擇照片按鈕 -->
+                <input type="file" id="file-input" multiple accept="image/*" class="hidden">
+                <button id="select-photos-btn" class="w-full mb-4 py-3 px-4 bg-green-500 text-white font-semibold rounded-xl shadow-lg hover:bg-green-600 transition duration-150 active:scale-95 transform">
+                    選擇照片
+                </button>
+                
+                <!-- 分類照片計數 (紅色格子) -->
+                <div id="file-count-box" class="mb-6 p-4 border-2 border-red-500 bg-red-50 rounded-xl text-center shadow-inner transition duration-300">
+                    <p class="text-red-700 font-bold text-lg">已選取 <span id="file-count-number">${selectedFiles.length}</span> 張照片</p>
+                </div>
+
+                <!-- 開始分類按鈕 -->
+                <button id="start-classification-btn" ${selectedFiles.length === 0 || appState.isSaving ? 'disabled' : ''} class="w-full py-3 px-4 bg-primary text-white font-bold rounded-xl shadow-lg transition duration-150 ease-in-out hover:bg-indigo-700 ${selectedFiles.length === 0 || appState.isSaving ? 'opacity-50 cursor-not-allowed' : 'active:scale-95 transform'}">
+                    ${appState.isSaving ? '正在同步...' : '開始分類 (JS 模擬 & 儲存)'}
+                </button>
+            `;
+
+            // 渲染人物卡片
+            ['p1', 'p2', 'p3'].forEach(id => {
+                const person = peopleForDisplay[id];
+                const card = document.getElementById(`person-${id}`);
+                card.innerHTML = `
+                    <div class="flex items-center p-3 bg-gray-50 rounded-xl shadow-sm border border-gray-200 cursor-pointer hover:bg-gray-100 transition duration-150" onclick="window.navigateToDetail('${id}')">
+                        <div class="w-12 h-12 rounded-full bg-gray-300 flex items-center justify-center text-gray-600 font-bold text-xl mr-4">
+                            ${id.substring(1)}
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-lg font-semibold text-gray-800">${person.name}</p>
+                            <p class="text-xs text-gray-500">已儲存照片: ${person.photoCount} 張</p>
+                        </div>
+                        <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                    </div>
+                `;
+            });
+
+            // 添加事件監聽器
+            document.getElementById('select-photos-btn').onclick = () => document.getElementById('file-input').click();
+            document.getElementById('file-input').onchange = handleFileSelection;
+            document.getElementById('start-classification-btn').onclick = () => {
+                if (appState.selectedFiles.length > 0) {
+                    simulateClassification(appState.selectedFiles);
+                }
+            };
+        }
+
+        // 渲染詳細頁面 (Detail)
+        function renderDetailPage(container) {
+            const personId = appState.currentPersonId;
+            const person = appState.people[personId];
+
+            if (!person) {
+                container.innerHTML = `<p class="text-red-500">錯誤：找不到人物資料。</p>`;
+                return;
+            }
+
+            container.innerHTML = `
+                <h1 class="text-2xl font-bold text-gray-800 mb-6">${person.name}</h1>
+                
+                <!-- 返回上一頁按鈕 -->
+                <button onclick="window.navigateBack()" class="flex items-center text-primary hover:text-indigo-700 transition duration-150 mb-6 active:scale-95 transform">
+                    <svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                    <span>返回上一頁</span>
+                </button>
+
+                <!-- 照片顯示區 -->
+                <div class="mb-8 p-4 border border-gray-300 bg-gray-100 rounded-xl shadow-inner min-h-[150px]">
+                    <p class="text-center text-gray-600 mb-3 font-semibold">已儲存照片 (${person.photoCount} 張)</p>
+                    <div class="flex flex-wrap gap-2 justify-center">
+                        ${person.files.length > 0 
+                            ? person.files.map((file, index) => 
+                                // 使用 <img src="..."> 來顯示來自模擬 URL 的圖片
+                                `<div class="w-16 h-16 rounded-lg overflow-hidden border border-gray-300 shadow-sm relative group">
+                                    <img src="${file.url || 'https://placehold.co/100x100/EEEEEE/999999?text=No+URL'}" 
+                                         alt="${file.name}" 
+                                         class="w-full h-full object-cover transition-opacity duration-300 group-hover:opacity-80"
+                                         onerror="this.onerror=null;this.src='https://placehold.co/100x100/EEEEEE/999999?text=Error';">
+                                    <span class="absolute bottom-0 left-0 w-full bg-black bg-opacity-50 text-white text-xs text-center truncate px-1" title="${file.name}">
+                                        ...${file.name.substring(file.name.length - Math.min(8, file.name.length))}
+                                    </span>
+                                </div>`).join('')
+                            : `<p class="text-sm text-gray-400">目前沒有照片，請點擊「新增照片」。</p>`
+                        }
+                    </div>
+                </div>
+
+                <!-- 新增照片按鈕 -->
+                <input type="file" id="detail-file-input" multiple accept="image/*" class="hidden">
+                <button id="add-photos-btn" ${appState.isSaving ? 'disabled' : ''} class="w-full py-3 px-4 bg-purple-500 text-white font-semibold rounded-xl shadow-md hover:bg-purple-600 transition duration-150 ${appState.isSaving ? 'opacity-50 cursor-not-allowed' : 'active:scale-95 transform'}">
+                    ${appState.isSaving ? '正在同步...' : '新增照片 (儲存雲端網址)'}
+                </button>
+            `;
+
+            // 添加事件監聽器
+            document.getElementById('add-photos-btn').onclick = () => document.getElementById('detail-file-input').click();
+            document.getElementById('detail-file-input').onchange = handleDetailFileAddition;
+        }
+
+        // 渲染分類結果頁面 (Results)
+        function renderResultsPage(container) {
+            const { people, classificationResults } = appState;
+            const totalClassified = Object.values(people).reduce((sum, p) => sum + (p.classifiedCount || 0), 0);
+
+            container.innerHTML = `
+                <h1 class="text-2xl font-bold text-gray-800 mb-6">分類結果 (雲端儲存)</h1>
+                <p class="text-sm text-gray-500 mb-6">以下是 ${totalClassified} 張照片的分類結果：</p>
+
+                <!-- 分類結果列表 -->
+                <div class="space-y-3 mb-8">
+                    ${['p1', 'p2', 'p3', 'unknown'].map(id => {
+                        const person = people[id];
+                        const files = classificationResults[id] || [];
+                        return `
+                        <div class="p-4 bg-indigo-50 border border-indigo-200 rounded-xl shadow-sm">
+                            <p class="font-semibold text-indigo-800">${person.name}</p>
+                            <p class="text-3xl font-extrabold text-indigo-600 mt-1">${person.classifiedCount || 0} <span class="text-base font-normal">張</span></p>
+                            ${files.length > 0 
+                                ? `<p class="text-xs text-indigo-500 mt-2">已分類檔案範例: ${files.slice(0, 2).join(', ')}${files.length > 2 ? '...' : ''}</p>`
+                                : ''
+                            }
+                        </div>
+                    `;
+                    }).join('')}
+                </div>
+
+                <!-- 返回主頁按鈕 -->
+                <button onclick="window.navigateBack()" class="w-full py-3 px-4 bg-primary text-white font-bold rounded-xl shadow-lg hover:bg-indigo-700 active:scale-95 transform transition duration-150">
+                    返回主頁
+                </button>
+            `;
+        }
+
+        // --- Main Render Function ---
+
+        function render() {
+            const app = document.getElementById('app');
+            
+            if (!isAuthReady) {
+                 // 顯示載入畫面，直到 Firebase 驗證完成
+                app.innerHTML = document.getElementById('loading-overlay').outerHTML;
+                return;
+            }
+
+            // 移除載入畫面，顯示應用程式內容
+            const overlay = document.getElementById('loading-overlay');
+            if (overlay) overlay.remove();
+
+            switch (appState.view) {
+                case 'main':
+                    renderMainPage(app);
+                    break;
+                case 'detail':
+                    renderDetailPage(app);
+                    break;
+                case 'results':
+                    renderResultsPage(app);
+                    break;
+            }
+        }
+
+        // 初始啟動
+        window.onload = initFirebase;
+
+        // 暴露給全局，以便在 HTML 中使用 onclick
+        window.navigateToDetail = navigateToDetail;
+        window.navigateBack = navigateBack;
+        window.handleDetailFileAddition = handleDetailFileAddition;
+        window.simulateClassification = simulateClassification; // 也暴露分類函數
+        
+    </script>
+</body>
+</html>
